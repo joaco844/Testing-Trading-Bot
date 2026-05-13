@@ -1,0 +1,8 @@
+.env
+venv/
+__pycache__/
+*.pyc
+data/*.csv
+results/*.json
+paper_trading/estado.json
+.DS_Store
