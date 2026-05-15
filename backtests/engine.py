@@ -165,6 +165,7 @@ class ResultadoBacktest:
             f"  Salidas por señal : {motivos.get('señal', 0)}",
             f"  Salidas por SL    : {motivos.get('stop_loss', 0)}",
             f"  Salidas por TP    : {motivos.get('take_profit', 0)}",
+            f"  Salidas expiradas : {motivos.get('expiracion', 0)}",
             f"{'='*55}",
         ]
         return "\n".join(lineas)
@@ -180,6 +181,7 @@ def correr_backtest(
     atr_sl_mult: Optional[float] = None,
     atr_tp_mult: Optional[float] = None,
     cooldown_sl_velas: int = 0,
+    expiracion_velas: int = 0,
 ) -> ResultadoBacktest:
     """
     Ejecuta el backtest con gestión de riesgo (SL/TP opcionales).
@@ -188,6 +190,11 @@ def correr_backtest(
         Cuántas velas esperar antes de permitir una nueva entrada
         después de un stop-loss. 0 = sin cooldown (comportamiento original).
         Evita re-entradas inmediatas tras SL, que generan churn.
+
+    expiracion_velas:
+        Si el trade no tocó SL ni TP en N velas, se cierra a mercado.
+        0 = sin expiración. Según MAESTRO sección 7.3: 20 velas.
+        Evita trades "zombie" que permanecen abiertos indefinidamente.
 
     Dos modos de SL/TP (mutuamente excluyentes, ATR tiene prioridad):
 
@@ -215,7 +222,8 @@ def correr_backtest(
     entrada_precio = None
     precio_sl      = None
     precio_tp      = None
-    velas_cooldown = 0       # velas restantes de bloqueo post-SL
+    velas_cooldown  = 0   # velas restantes de bloqueo post-SL
+    velas_en_trade  = 0   # velas transcurridas desde la entrada actual
     trades: List[Trade] = []
     equity: List[float] = []
 
@@ -238,6 +246,7 @@ def correr_backtest(
         if en_posicion:
             salida_precio = None
             motivo_salida = None
+            velas_en_trade += 1
 
             # 1. Stop-loss — usando el LOW de la vela
             if precio_sl is not None and low <= precio_sl:
@@ -249,7 +258,12 @@ def correr_backtest(
                 salida_precio = precio_tp
                 motivo_salida = "take_profit"
 
-            # 3. Señal de salida de la estrategia
+            # 3. Expiración — MAESTRO sección 7.3: cerrar a mercado a las N velas
+            elif expiracion_velas > 0 and velas_en_trade >= expiracion_velas:
+                salida_precio = precio
+                motivo_salida = "expiracion"
+
+            # 4. Señal de salida de la estrategia
             elif señal == -1:
                 salida_precio = precio
                 motivo_salida = "señal"
@@ -266,9 +280,10 @@ def correr_backtest(
                 )
                 capital += trade.pnl_neto
                 trades.append(trade)
-                en_posicion = False
-                precio_sl   = None
-                precio_tp   = None
+                en_posicion    = False
+                precio_sl      = None
+                precio_tp      = None
+                velas_en_trade = 0
                 if motivo_salida == "stop_loss":
                     velas_cooldown = cooldown_sl_velas
 

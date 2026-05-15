@@ -34,6 +34,8 @@ from typing import Callable, Dict
 
 from strategies.base import EstrategiaBase
 from indicators.axes import calcular_ejes
+from indicators.trend import ema as _ema
+from indicators.positioning import calcular_e6
 
 
 # ── Definición de un patrón ──────────────────────────────────────────────────
@@ -301,6 +303,9 @@ def _confianza_patron(ejes: pd.DataFrame, patron: Patron) -> pd.Series:
 
     Un eje "coincide" si su valor está dentro de ±1 del valor en la firma.
     El mandatorio no tiene tolerancia — si no se cumple, confianza = 0.
+    El score debe estar dentro del rango [score_min, score_max] del patrón —
+    si no, confianza = 0. Esto evita que A1 se active con score=5 cuando
+    ese rango pertenece a A3 (MAESTRO sección 4).
 
     Todas las operaciones son vectorizadas sobre el DataFrame completo.
     """
@@ -381,11 +386,13 @@ class AngulosCruzados(EstrategiaBase):
         todos_tfs: Dict[str, pd.DataFrame],
         umbral_entrada: float = 70.0,
         umbral_salida:  float = 50.0,
+        df_funding: pd.DataFrame | None = None,
     ):
         super().__init__("Ángulos Cruzados")
         self.todos_tfs      = todos_tfs
         self.umbral_entrada = umbral_entrada
         self.umbral_salida  = umbral_salida
+        self.df_funding     = df_funding
 
     def calcular_señales(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -421,39 +428,36 @@ class AngulosCruzados(EstrategiaBase):
             mejor_confianza = mejor_confianza.where(~supera, conf)
             mejor_direccion = mejor_direccion.where(~supera, patron.direccion)
 
-        # ── 4. Persistencia de 2 velas ────────────────────────────────────────
-        # El patrón solo se activa si supera el umbral en 2 velas consecutivas.
-        # rolling(2).min() sobre un bool: True solo si las 2 últimas son True.
-        # Esto evita señales de ruido de una sola vela.
+        # ── 4. Persistencia de 2 velas ───────────────────────────────────────
         patron_long  = mejor_direccion == "long"
         patron_short = mejor_direccion == "short"
 
-        # 2 velas consecutivas con patrón long activo → run confirmado
         long_activo = (
             patron_long
             & patron_long.shift(1).fillna(False)
         )
 
-        # Entrada solo en la transición: primera vela del run (edge detection).
-        # Evita re-entradas mid-pattern después de un SL/TP.
-        long_se_activa = long_activo & ~long_activo.shift(1).fillna(False)
-
-        # Salida: 2 velas consecutivas donde la confianza del mejor patrón
-        # cayó por debajo del umbral de salida
+        # Salida: 2 velas consecutivas donde la confianza cayó < umbral_salida
         sin_señal = mejor_confianza < self.umbral_salida
         cierre    = (
             sin_señal
             & sin_señal.shift(1).fillna(False)
         )
 
-        # ── 5. Generar señal ─────────────────────────────────────────────────
-        # Regla: si en la misma vela hay señal de entrada Y de cierre,
-        # la entrada tiene prioridad (caso raro pero posible al inicio).
-        señal = pd.Series(0, index=df.index, dtype=int)
-        señal[cierre]        = -1
-        señal[long_se_activa] = 1
+        # ── 5. Filtro E6 — bloquear entradas con funding extremo ────────────
+        # E6 = -2 → funding > +0.10% (euforia extrema de longs)
+        # E6 = -1 → funding > +0.05% (mercado sobrecargado)
+        # Solo bloqueamos cuando el funding señala riesgo real (E6 <= -1)
+        if self.df_funding is not None:
+            e6 = calcular_e6(df, self.df_funding)
+            long_activo = long_activo & (e6 > -1)
 
-        # ── 6. Ensamblar resultado ────────────────────────────────────────────
+        # ── 6. Generar señal ─────────────────────────────────────────────────
+        señal = pd.Series(0, index=df.index, dtype=int)
+        señal[cierre]       = -1
+        señal[long_activo]  = 1
+
+        # ── 7. Ensamblar resultado ────────────────────────────────────────────
         df_out = df.copy()
         df_out["e1"]        = ejes["e1"]
         df_out["e2"]        = ejes["e2"]
@@ -464,5 +468,7 @@ class AngulosCruzados(EstrategiaBase):
         df_out["patron"]    = mejor_codigo
         df_out["confianza"] = mejor_confianza
         df_out["señal"]     = señal
+        if self.df_funding is not None:
+            df_out["e6"] = calcular_e6(df, self.df_funding)
 
         return df_out

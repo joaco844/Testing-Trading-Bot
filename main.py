@@ -85,64 +85,84 @@ def modo_angulos():
     from backtests.engine import correr_backtest
     from backtests.splitter import split_datos
     from indicators.volatility import atr
+    from data.downloader_oi import cargar_funding
 
     SIMBOLO        = "BTC/USDT"
     CAPITAL        = 10_000.0
     FEE            = 0.001      # 0.1% Binance maker/taker
     ATR_SL         = 1.0        # SL = 1× ATR  (definido en MAESTRO sección 7.2)
-    ATR_TP         = 2.0        # TP = 2× ATR → R:R 2:1 (break-even baja a 33.3%)
+    ATR_TP         = 2.0        # TP = 2× ATR → R:R 2:1
     COOLDOWN_SL    = 4          # velas bloqueadas tras SL (frenar churn)
+    EXPIRACION     = 20         # MAESTRO sección 7.3: cerrar a mercado a las 20 velas
     UMBRAL_ENTRADA = 70.0
     UMBRAL_SALIDA  = 50.0
 
+    TF_PRINCIPAL  = "1h"
+    USAR_HOLDOUT  = False
+
     print("=" * 60)
-    print("  SISTEMA DE ÁNGULOS CRUZADOS — BTC/USDT 15m")
+    if USAR_HOLDOUT:
+        print(f"  ⚠️  HOLDOUT TEST — RESULTADO DEFINITIVO")
+    print(f"  SISTEMA DE ÁNGULOS CRUZADOS — BTC/USDT {TF_PRINCIPAL}")
     print("=" * 60)
     print(f"  Patrones cargados : {len(CATALOGO)}")
     print(f"  Capital inicial   : ${CAPITAL:,.0f}")
     print(f"  Fee por trade     : {FEE*100:.1f}%")
     print(f"  SL / TP           : {ATR_SL}× ATR / {ATR_TP}× ATR  (R:R {ATR_TP/ATR_SL:.1f}:1)")
     print(f"  Cooldown post-SL  : {COOLDOWN_SL} velas")
+    print(f"  Expiración trade  : {EXPIRACION} velas")
     print(f"  Umbral entrada    : {UMBRAL_ENTRADA:.0f}% confianza")
     print()
 
     # 1. Cargar datos
     print("Cargando datos multi-TF...")
-    tfs    = cargar_multi_tf(SIMBOLO)
-    df_15m = limpiar(tfs["15m"])
-    df_15m["atr"] = atr(df_15m, periodo=14)
-    print(f"  15m: {len(df_15m):,} velas | "
-          f"{df_15m.index[0].strftime('%Y-%m-%d')} → "
-          f"{df_15m.index[-1].strftime('%Y-%m-%d')}")
+    tfs          = cargar_multi_tf(SIMBOLO)
+    df_principal = limpiar(tfs[TF_PRINCIPAL])
+    df_principal["atr"] = atr(df_principal, periodo=14)
+    print(f"  {TF_PRINCIPAL}: {len(df_principal):,} velas | "
+          f"{df_principal.index[0].strftime('%Y-%m-%d')} → "
+          f"{df_principal.index[-1].strftime('%Y-%m-%d')}")
+
+    # Cargar funding rate (opcional — si no existe, corre sin E6)
+    try:
+        df_funding = cargar_funding("BTCUSDT")
+        print(f"  Funding: {len(df_funding):,} registros | "
+              f"{df_funding.index[0].strftime('%Y-%m-%d')} → "
+              f"{df_funding.index[-1].strftime('%Y-%m-%d')}")
+    except FileNotFoundError:
+        df_funding = None
+        print("  Funding: no disponible (corré descargar_datos_posicionamiento)")
     print()
 
     # 2. Calcular señales
     print("Calculando ejes y detectando patrones...")
-    estrategia = AngulosCruzados(tfs, UMBRAL_ENTRADA, UMBRAL_SALIDA)
-    df_señales = estrategia.calcular_señales(df_15m)
+    estrategia = AngulosCruzados(tfs, UMBRAL_ENTRADA, UMBRAL_SALIDA, df_funding=df_funding)
+    df_señales = estrategia.calcular_señales(df_principal)
 
     n_entradas = (df_señales["señal"] == 1).sum()
     print(f"  Señales de entrada: {n_entradas:,}")
     print()
 
-    # 3. Split train/test — solo usamos development set
-    split  = split_datos(df_señales, holdout_pct=0.20)
-    df_dev = split.development
-    print(f"Development set (80%): {len(df_dev):,} velas | "
-          f"{df_dev.index[0].strftime('%Y-%m-%d')} → "
-          f"{df_dev.index[-1].strftime('%Y-%m-%d')}")
+    # 3. Split — elegir development o holdout
+    split    = split_datos(df_señales, holdout_pct=0.20)
+    df_test  = split.holdout if USAR_HOLDOUT else split.development
+    set_nombre = "Holdout set (20%)" if USAR_HOLDOUT else "Development set (80%)"
+    print(f"{set_nombre}: {len(df_test):,} velas | "
+          f"{df_test.index[0].strftime('%Y-%m-%d')} → "
+          f"{df_test.index[-1].strftime('%Y-%m-%d')}")
     print()
 
     # 4. Backtest
     print("Corriendo backtest...")
     resultado = correr_backtest(
-        df_señales=df_dev,
-        nombre_estrategia="Ángulos Cruzados 15m",
+        df_señales=df_test,
+        nombre_estrategia=f"Ángulos Cruzados {TF_PRINCIPAL}",
         capital_inicial=CAPITAL,
         fee_pct=FEE,
         atr_sl_mult=ATR_SL,
         atr_tp_mult=ATR_TP,
         cooldown_sl_velas=COOLDOWN_SL,
+        expiracion_velas=EXPIRACION,
     )
     print(resultado.resumen())
 
@@ -155,18 +175,19 @@ def modo_angulos():
     for trade in resultado.trades:
         ts = trade.entrada_tiempo
         # Buscar el patrón activo en el timestamp de entrada (o el más cercano anterior)
-        if ts in df_dev.index:
-            patron = df_dev.loc[ts, "patron"]
+        if ts in df_test.index:
+            patron = df_test.loc[ts, "patron"]
         else:
-            idx_pos = df_dev.index.searchsorted(ts)
+            idx_pos = df_test.index.searchsorted(ts)
             if idx_pos == 0:
                 patron = "—"
             else:
-                patron = df_dev.iloc[idx_pos - 1]["patron"]
+                patron = df_test.iloc[idx_pos - 1]["patron"]
 
         if patron not in stats:
             stats[patron] = {"trades": 0, "ganadores": 0, "pnl": 0.0,
-                             "stop_loss": 0, "take_profit": 0, "señal": 0, "fin_datos": 0}
+                             "stop_loss": 0, "take_profit": 0, "señal": 0,
+                             "expiracion": 0, "fin_datos": 0}
         stats[patron]["trades"]    += 1
         stats[patron]["pnl"]       += trade.pnl_neto
         stats[patron]["ganadores"] += 1 if trade.pnl_neto > 0 else 0
@@ -187,6 +208,141 @@ def modo_angulos():
               f"  ${s['pnl']:>+9.2f} {sl_n:>5} {tp_n:>5}")
 
     print("=" * 70)
+
+
+def modo_pullback(simbolo: str = "BTC/USDT"):
+    """
+    Backtest del Sistema Tendencia + Pullback sobre cualquier par 1h.
+
+    Uso:
+      python3 main.py pullback              → BTC/USDT (default)
+      python3 main.py pullback ETH/USDT     → ETH/USDT
+      python3 main.py pullback SOL/USDT     → SOL/USDT
+
+    Si el CSV del símbolo no existe en data/ lo descarga automáticamente.
+    """
+    from data.downloader import cargar_csv, descargar_ohlcv, guardar_csv
+    from data.inspector import limpiar
+    from strategies.tendencia_pullback import TendenciaPullback
+    from backtests.engine import correr_backtest
+    from backtests.splitter import split_datos
+    import os
+
+    CAPITAL      = 10_000.0
+    FEE          = 0.001
+    ATR_SL       = 1.5
+    ATR_TP       = 3.0
+    COOLDOWN_SL  = 4
+    EXPIRACION   = 20
+    ATR_MIN_PCT  = 0.70        # derivado de BTC — aplicado sin cambios a otros activos
+    USAR_HOLDOUT = False
+
+    print("=" * 60)
+    if USAR_HOLDOUT:
+        print("  HOLDOUT TEST — RESULTADO DEFINITIVO")
+    print(f"  TENDENCIA + PULLBACK — {simbolo} 1h")
+    print("=" * 60)
+    print(f"  Capital inicial   : ${CAPITAL:,.0f}")
+    print(f"  Fee por trade     : {FEE*100:.1f}%")
+    print(f"  SL / TP           : {ATR_SL}× ATR / {ATR_TP}× ATR  (R:R {ATR_TP/ATR_SL:.1f}:1)")
+    print(f"  Cooldown post-SL  : {COOLDOWN_SL} velas")
+    print(f"  Expiración trade  : {EXPIRACION} velas")
+    print()
+
+    # Descargar si el CSV no existe (24 meses = ~17,500 velas de 1h)
+    try:
+        df = cargar_csv(simbolo, "1h")
+    except FileNotFoundError:
+        print(f"  CSV no encontrado — descargando {simbolo} 1h desde Binance...")
+        df = descargar_ohlcv(simbolo, "1h", 17_500, "binance")
+        guardar_csv(df, simbolo, "1h")
+        print(f"  Descarga completa: {len(df):,} velas")
+        print()
+
+    df = limpiar(df)
+
+    estrategia = TendenciaPullback(atr_min_pct=ATR_MIN_PCT)
+    df_señales = estrategia.calcular_señales(df)
+
+    n_entradas = (df_señales["señal"] == 1).sum()
+    print(f"  Total velas      : {len(df_señales):,}")
+    print(f"  Señales entrada  : {n_entradas:,}")
+    print()
+
+    split    = split_datos(df_señales, holdout_pct=0.20)
+    df_test  = split.holdout if USAR_HOLDOUT else split.development
+    set_nombre = "Holdout set (20%)" if USAR_HOLDOUT else "Development set (80%)"
+    print(f"{set_nombre}: {len(df_test):,} velas | "
+          f"{df_test.index[0].strftime('%Y-%m-%d')} → "
+          f"{df_test.index[-1].strftime('%Y-%m-%d')}")
+    print()
+
+    resultado = correr_backtest(
+        df_señales=df_test,
+        nombre_estrategia=f"Tendencia + Pullback {simbolo} 1h",
+        capital_inicial=CAPITAL,
+        fee_pct=FEE,
+        atr_sl_mult=ATR_SL,
+        atr_tp_mult=ATR_TP,
+        cooldown_sl_velas=COOLDOWN_SL,
+        expiracion_velas=EXPIRACION,
+    )
+    print(resultado.resumen())
+
+
+def modo_diario():
+    """
+    Backtest del Sistema Trend Following Diario sobre BTC/USDT.
+
+    Usa datos 1h existentes (ya descargados) para simular tanto las
+    condiciones diarias como el timing intradía de entradas y parciales.
+    """
+    from data.downloader import cargar_csv
+    from data.inspector import limpiar
+    from strategies.trend_following_diario import TrendFollowingDiario
+    from backtests.engine_parciales import correr_backtest_parciales
+    from backtests.splitter import split_datos
+
+    CAPITAL    = 10_000.0
+    FEE        = 0.001      # 0.1%
+    RIESGO_PCT = 0.01       # 1% del capital por trade
+
+    print("=" * 60)
+    print("  TREND FOLLOWING DIARIO — BTC/USDT")
+    print("=" * 60)
+    print(f"  Capital inicial   : ${CAPITAL:,.0f}")
+    print(f"  Fee por trade     : {FEE*100:.1f}%")
+    print(f"  Riesgo por trade  : {RIESGO_PCT*100:.1f}% del capital")
+    print(f"  Confirmaciones    : ≥ 2 de 3 (EMA200 / ADX≥30 / Estructura semanal)")
+    print(f"  Sesión            : UTC 00:00 – 23:59")
+    print()
+
+    df_1h = cargar_csv("BTC/USDT", "1h")
+    df_1h = limpiar(df_1h)
+
+    print("Construyendo datos diarios y calculando señales...")
+    estrategia = TrendFollowingDiario()
+    df_señales, df_1h = estrategia.preparar_datos(df_1h)
+
+    n_señales = (df_señales["señal"] == 1).sum()
+    print(f"  Días con señal    : {n_señales} de {len(df_señales)} días")
+    print()
+
+    # Split temporal 80/20 sobre los datos diarios
+    split    = split_datos(df_señales, holdout_pct=0.20)
+    df_dev   = split.development
+    split.info()
+    print()
+
+    resultado = correr_backtest_parciales(
+        df_1h     = df_1h,
+        df_diario = df_dev,
+        nombre    = "Trend Following Diario BTC",
+        capital_inicial = CAPITAL,
+        fee_pct   = FEE,
+        riesgo_pct = RIESGO_PCT,
+    )
+    print(resultado.resumen())
 
 
 def modo_paper_angulos():
@@ -297,6 +453,11 @@ if __name__ == "__main__":
 
     if modo == "backtest":
         modo_backtest()
+    elif modo == "pullback":
+        simbolo = sys.argv[2] if len(sys.argv) > 2 else "BTC/USDT"
+        modo_pullback(simbolo)
+    elif modo == "diario":
+        modo_diario()
     elif modo == "angulos":
         modo_angulos()
     elif modo == "paper_angulos":
